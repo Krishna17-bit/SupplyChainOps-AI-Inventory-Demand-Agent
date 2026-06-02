@@ -1,0 +1,27 @@
+# Secrets and local env
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Streamlit and local credentials
+.streamlit/secrets.toml
+credentials.json
+token.json
+
+# Runtime outputs
+outputs/
+audit_logs/
+*.log
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/

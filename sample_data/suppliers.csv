@@ -1,0 +1,7 @@
+supplier_id,supplier_name,country,lead_time_days,lead_time_std_days,on_time_rate,defect_rate,payment_terms,min_order_value
+SUP-01,Astra Components,India,7,2,0.94,0.012,Net 30,500
+SUP-02,Nova Wholesale,Vietnam,14,5,0.83,0.031,Net 45,1200
+SUP-03,Peak Distributors,India,5,1,0.97,0.007,Net 15,300
+SUP-04,Orbit Merchants,China,21,8,0.76,0.045,Prepaid 50%,2000
+SUP-05,BlueRiver Supply,India,9,3,0.88,0.022,Net 30,700
+SUP-06,NorthStar Traders,Thailand,18,6,0.81,0.028,Net 60,1500

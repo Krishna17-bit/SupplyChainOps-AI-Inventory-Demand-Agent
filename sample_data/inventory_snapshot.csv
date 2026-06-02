@@ -1,0 +1,21 @@
+sku,product_name,stock_on_hand,warehouse,unit_cost,supplier_id,min_order_qty,storage_class
+SKU-001,Hydration Bottle,40,Bengaluru DC,4.8,SUP-01,100,fragile
+SKU-002,Protein Bar Box,54,Mumbai DC,8.48,SUP-02,50,standard
+SKU-003,Yoga Mat,30,Mumbai DC,12.76,SUP-03,50,standard
+SKU-004,Running Socks,65,Bengaluru DC,13.44,SUP-04,100,standard
+SKU-005,Smart Scale,185,Mumbai DC,18.02,SUP-05,20,fragile
+SKU-006,Resistance Bands,359,Bengaluru DC,6.96,SUP-06,50,fragile
+SKU-007,Meal Prep Container,216,Delhi DC,8.64,SUP-01,20,fragile
+SKU-008,Trail Mix Pack,295,Bengaluru DC,12.72,SUP-02,50,standard
+SKU-009,Vitamin Organizer,85,Delhi DC,17.4,SUP-03,20,standard
+SKU-010,Foam Roller,125,Mumbai DC,17.28,SUP-04,20,standard
+SKU-011,Sports Towel,49,Mumbai DC,7.42,SUP-05,30,fragile
+SKU-012,Electrolyte Pack,0,Mumbai DC,11.6,SUP-06,50,cold-chain
+SKU-013,Knee Support,81,Mumbai DC,12.48,SUP-01,50,standard
+SKU-014,Gym Gloves,398,Mumbai DC,16.96,SUP-02,30,fragile
+SKU-015,Jump Rope,143,Delhi DC,22.04,SUP-03,100,standard
+SKU-016,Massage Ball,575,Bengaluru DC,7.68,SUP-04,20,standard
+SKU-017,Compression Sleeve,272,Delhi DC,11.66,SUP-05,20,fragile
+SKU-018,Training Cone,0,Bengaluru DC,16.24,SUP-06,20,standard
+SKU-019,Water Filter,359,Delhi DC,16.32,SUP-01,50,standard
+SKU-020,Energy Gel,272,Mumbai DC,21.2,SUP-02,50,standard
