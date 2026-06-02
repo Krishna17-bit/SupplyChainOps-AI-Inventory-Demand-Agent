@@ -27,7 +27,6 @@ SupplyChainOps AI is a local Streamlit command center for supply-chain operation
 - Audit JSON export
 - Excel export pack
 - Optional AI narrative reasoning through `.env`
-- Black/white UI with orange and blue accents
 
 ## Run locally
 
@@ -55,7 +54,7 @@ Open `.env` and add:
 
 ```env
 GEMINI_API_KEY=your_key_here
-GEMINI_MODEL=gemini-2.5-pro
+GEMINI_MODEL=
 ```
 
 The UI does not show provider/model names. Local analytics, forecasting, optimization, risk scoring, procurement drafts, and exports work even without an API key.
@@ -81,14 +80,3 @@ For Postgres/MySQL, install the relevant driver locally and use a SQLAlchemy URL
 3. Click **Load workspace**.
 4. Click **Run supply-chain analysis**.
 5. Review Inventory Health, Demand Forecast, Stockout Risk, Reorder Plan, Supplier Risk, Automation Center, and Export Center.
-
-## GitHub safety
-
-Never push `.env` or private client data.
-
-```bash
-git check-ignore -v .env
-git ls-files .env
-```
-
-`git ls-files .env` should print nothing.
