@@ -13,7 +13,8 @@ import streamlit as st
 from src.ai_client import AIReasoningClient
 from src.data_loader import env_db_url, load_sample_tables, load_sqlalchemy_tables, load_sqlite_path, load_uploaded_tables
 from src.export_utils import df_to_csv_bytes, make_automation_json, make_excel_workbook
-from src.supply_analysis import build_supply_model, make_report, model_to_jsonable, pick_tables, procurement_email_draft, z_for_service
+from datetime import datetime, timedelta
+from src.supply_analysis import build_supply_model, make_report, model_to_jsonable, pick_tables, procurement_email_draft, z_for_service, score_suppliers_mcda, generate_rfq_draft
 from src.ui_styles import APP_CSS
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -128,6 +129,8 @@ if "report" not in st.session_state:
     st.session_state.report = ""
 if "ai_summary" not in st.session_state:
     st.session_state.ai_summary = ""
+if "saved_scenarios" not in st.session_state:
+    st.session_state.saved_scenarios = []
 
 load_col, run_col = st.columns([1, 1])
 with load_col:
@@ -215,8 +218,8 @@ if model:
 
     tab_names = [
         "Inventory Health", "Demand Forecast", "SKU Detail Planner", "Stockout Risk", 
-        "Reorder Plan", "Supplier Risk", "Returns & Quality", "Inter-DC Transfers",
-        "What-If Simulator", "ROI & Cost Optimizer", "Automation Center", 
+        "Reorder Plan", "Supplier scorecard & RFQ", "Returns & Quality", "Inter-DC Transfers",
+        "What-If & Scenario Hub", "ROI & Cost Optimizer", "Automation Center", 
         "Procurement Assistant", "Executive Report", "Export Center"
     ]
     tabs = st.tabs(tab_names)
@@ -305,6 +308,52 @@ if model:
         else:
             st.info("No historical sales data found for this SKU to plot.")
 
+        # Explainable Operations mathematical solver details
+        with st.expander("Explainable Operations (Mathematical Formula Breakdown)"):
+            st.markdown("##### Recommendation Calculation Steps:")
+            
+            avg_demand = float(sku_row["avg_daily_demand"])
+            lead_time = float(sku_row["lead_time_days"])
+            safety_stock = float(sku_row["safety_stock"])
+            reorder_point = float(sku_row["reorder_point"])
+            stock = float(sku_row["stock"])
+            incoming_qty = float(sku_row["incoming_qty"])
+            net_position = stock + incoming_qty
+            shortage_qty = float(sku_row["shortage_qty"])
+            eoq = float(sku_row["eoq"])
+            rec_qty = float(sku_row["recommended_order_qty"])
+            unit_cost = float(sku_row["unit_cost"])
+            
+            st.markdown(f"""
+            1. **Lead Time Demand**:
+               $$\\text{{Lead Time Demand}} = \\text{{Avg Daily Demand}} \\times \\text{{Lead Time Days}}$$
+               $$\\text{{Lead Time Demand}} = {avg_demand:.2f} \\times {lead_time:.1f} = {avg_demand * lead_time:.2f}\\text{{ units}}$$
+               
+            2. **Safety Stock**:
+               $$\\text{{Safety Stock}} = z \\times \\sigma_d \\times \\sqrt{{L}}$$
+               $$\\text{{Safety Stock}} = {model['params']['service_level']}\\text{{ z-score}} \\times {sku_row['std_daily_demand']:.2f} \\times \\sqrt{{{lead_time:.1f}}} = {safety_stock:.2f}\\text{{ units}}$$
+               
+            3. **Reorder Point (ROP)**:
+               $$\\text{{ROP}} = \\text{{Lead Time Demand}} + \\text{{Safety Stock}}$$
+               $$\\text{{ROP}} = {avg_demand * lead_time:.2f} + {safety_stock:.2f} = {reorder_point:.2f}\\text{{ units}}$$
+               
+            4. **Net Inventory Position**:
+               $$\\text{{Net Position}} = \\text{{Stock On Hand}} + \\text{{Incoming Quantity}}$$
+               $$\\text{{Net Position}} = {stock:.0f} + {incoming_qty:.0f} = {net_position:.0f}\\text{{ units}}$$
+               
+            5. **Net Shortage**:
+               $$\\text{{Shortage}} = \\max(0, \\text{{ROP}} - \\text{{Net Position}})$$
+               $$\\text{{Shortage}} = \\max(0, {reorder_point:.2f} - {net_position:.0f}) = {shortage_qty:.2f}\\text{{ units}}$$
+               
+            6. **Economic Order Quantity (EOQ)**:
+               $$\\text{{EOQ}} = \\sqrt{{\\frac{{2 \\times \\text{{Annual Demand}} \\times \\text{{Order Cost}}}}{{\\text{{Holding Cost Rate}} \\times \\text{{Unit Cost}}}}}}$$
+               $$\\text{{EOQ}} = \\sqrt{{\\frac{{2 \\times {sku_row['annual_demand_qty']:.1f} \\times {model['params']['order_cost']:.1f}}}{{{model['params']['holding_cost_rate']:.2f} \\times {unit_cost:.2f}}}}} = {eoq:.2f}\\text{{ units}}$$
+               
+            7. **Final Recommended Order Quantity**:
+               $$\\text{{Final Order Qty}} = \\max(\\text{{Shortage}}, \\text{{EOQ}} \\times (\\text{{Shortage}} > 0))$$
+               $$\\text{{Final Order Qty}} = \\max({shortage_qty:.2f}, {eoq:.2f} \\times ({shortage_qty:.2f} > 0)) = {rec_qty:.0f}\\text{{ units}}$$
+            """)
+
     with tab_risk:
         st.markdown("### Stockout and overstock risk")
         risk_df = model["inventory_health"].copy().replace([np.inf, -np.inf], np.nan)
@@ -327,13 +376,79 @@ if model:
             st.plotly_chart(fig, use_container_width=True)
 
     with tab_supplier:
-        st.markdown("### Supplier risk")
+        st.markdown("### Supplier Scorecard & RFQ Writer")
+        st.markdown("<span class='small-muted'>Use Multi-Criteria Decision Analysis (MCDA) to rank suppliers dynamically. Then, instantly draft quote requests.</span>", unsafe_allow_html=True)
+        
+        # MCDA weights controllers
+        st.markdown("##### 1. Configure Evaluation Weights")
+        wc1, wc2, wc3, wc4 = st.columns(4)
+        with wc1:
+            w_price = st.slider("Price Weight (Cost)", 0.0, 1.0, 0.3, step=0.05, key="w_price_slider")
+        with wc2:
+            w_speed = st.slider("Speed Weight (Lead Time)", 0.0, 1.0, 0.2, step=0.05, key="w_speed_slider")
+        with wc3:
+            w_reliability = st.slider("Reliability Weight (On-Time)", 0.0, 1.0, 0.3, step=0.05, key="w_reliability_slider")
+        with wc4:
+            w_quality = st.slider("Quality Weight (Quality Rate)", 0.0, 1.0, 0.2, step=0.05, key="w_quality_slider")
+            
+        # Run MCDA scoring
         supplier_risk = model["supplier_risk"]
-        render_dark_table(supplier_risk, height=460)
-        if not supplier_risk.empty:
-            fig = px.bar(supplier_risk, x="supplier_name", y="supplier_risk_score", color="risk_level", hover_data=["supplier_id","avg_lead_time","avg_on_time_rate","avg_defect_rate"], title="Supplier risk score")
-            fig.update_layout(height=420, paper_bgcolor="#070707", plot_bgcolor="#111111", font_color="#ffffff", xaxis_tickangle=-25)
-            st.plotly_chart(fig, use_container_width=True)
+        mcda_df = score_suppliers_mcda(supplier_risk, w_price, w_speed, w_reliability, w_quality)
+        
+        if mcda_df.empty:
+            st.info("No supplier data loaded.")
+        else:
+            # Sorted by score
+            mcda_df = mcda_df.sort_values("mcda_score", ascending=False)
+            
+            # Plot scores
+            fig_score = px.bar(
+                mcda_df, 
+                x="supplier_name", 
+                y="mcda_score", 
+                color="mcda_score", 
+                color_continuous_scale="Oranges", 
+                hover_data=["risk_level", "avg_lead_time", "avg_on_time_rate", "avg_defect_rate"],
+                title="Supplier Scorecard Rankings (Weighted MCDA)"
+            )
+            fig_score.update_layout(height=400, paper_bgcolor="#070707", plot_bgcolor="#111111", font_color="#ffffff")
+            st.plotly_chart(fig_score, use_container_width=True)
+            
+            # Render details
+            render_dark_table(mcda_df[["supplier_id", "supplier_name", "mcda_score", "avg_unit_cost", "avg_lead_time", "avg_on_time_rate", "avg_defect_rate", "risk_level"]], height=320)
+            
+        # RFQ Writer Section
+        st.divider()
+        st.markdown("##### 2. Supplier Request for Quote (RFQ) Writer")
+        rfq_suppliers = sorted(model["supplier_risk"]["supplier_name"].unique()) if not model["supplier_risk"].empty else []
+        rfq_skus = sorted(model["inventory_health"]["sku"].unique()) if not model["inventory_health"].empty else []
+        
+        if rfq_suppliers and rfq_skus:
+            rfqc1, rfqc2 = st.columns(2)
+            with rfqc1:
+                sel_supp = st.selectbox("Select Supplier", rfq_suppliers, key="rfq_supp_select")
+                sel_sku = st.selectbox("Select Product SKU", rfq_skus, key="rfq_sku_select")
+                
+                # Fetch SKU specific product name and unit cost to populate defaults
+                sku_data = model["inventory_health"][model["inventory_health"]["sku"] == sel_sku].iloc[0]
+                default_prod = sku_data["product"]
+                default_cost = float(sku_data["unit_cost"])
+                
+                # Recommended quantity from model
+                rec_qty_val = float(sku_data["recommended_order_qty"])
+                default_qty = int(rec_qty_val) if rec_qty_val > 0 else 100
+                
+            with rfqc2:
+                rfq_qty = st.number_input("Order Quantity", min_value=1, value=default_qty, step=50, key="rfq_qty_input")
+                rfq_price = st.number_input("Target Unit Price ($)", min_value=0.0, value=default_cost, step=1.0, key="rfq_price_input")
+                rfq_delivery = st.text_input("Requested Delivery Date", value=(datetime.now() + timedelta(days=20)).strftime("%Y-%m-%d"), key="rfq_delivery_input")
+            
+            # Generate email
+            rfq_email = generate_rfq_draft(sel_supp, sel_sku, default_prod, rfq_qty, rfq_price, rfq_delivery)
+            st.text_area("Generated RFQ Email Draft", value=rfq_email, height=300)
+            st.caption("Review and edit this draft before sending to your vendor.")
+        else:
+            st.info("Suppliers or inventory data not available to generate RFQ.")
 
     with tab_returns:
         st.markdown("### Returns & Quality Analytics")
@@ -416,8 +531,66 @@ if model:
             st.plotly_chart(fig_trans, use_container_width=True)
 
     with tab_whatif:
-        st.markdown("### What-if simulator results")
+        st.markdown("### What-if Simulator & Scenario Hub")
         st.markdown(f"<div class='panel'>Current scenario uses demand multiplier <b>{demand_multiplier:.2f}x</b>, supplier delay <b>{lead_time_delay} days</b>, service level <b>{int(service_level*100)}%</b>, and forecast horizon <b>{horizon_days} days</b>.</div>", unsafe_allow_html=True)
+        
+        # Save Current Scenario Form
+        st.markdown("##### Save Current Scenario Config")
+        col_s1, col_s2 = st.columns([2, 1])
+        with col_s1:
+            sc_name = st.text_input("Scenario Label / Name", value=f"Scenario {len(st.session_state.saved_scenarios) + 1}", key="sc_name_input")
+        with col_s2:
+            st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+            save_clicked = st.button("Save Scenario", use_container_width=True)
+            
+        if save_clicked:
+            # Check if name already exists, remove it
+            st.session_state.saved_scenarios = [s for s in st.session_state.saved_scenarios if s["name"] != sc_name]
+            st.session_state.saved_scenarios.append({
+                "name": sc_name,
+                "demand_multiplier": demand_multiplier,
+                "lead_time_delay": lead_time_delay,
+                "service_level": service_level,
+                "total_inventory_value": float(model["kpis"]["total_inventory_value"]),
+                "recommended_order_value": float(model["kpis"]["recommended_order_value"]),
+                "critical_skus": int(model["kpis"]["critical_skus"])
+            })
+            st.success(f"Successfully saved scenario '{sc_name}'!")
+            
+        # Display saved scenarios comparison if they exist
+        if st.session_state.saved_scenarios:
+            st.divider()
+            st.markdown("##### Saved Scenarios Comparison")
+            sc_df = pd.DataFrame(st.session_state.saved_scenarios)
+            
+            # Display comparison table
+            render_dark_table(sc_df, height=200)
+            
+            # Draw charts
+            c_s1, c_s2 = st.columns(2)
+            with c_s1:
+                fig_sc_val = px.bar(
+                    sc_df, x="name", y=["total_inventory_value", "recommended_order_value"],
+                    barmode="group", title="Carrying Value vs Reorder Value ($)",
+                    labels={"value": "Amount ($)", "variable": "Metric"}
+                )
+                fig_sc_val.update_layout(height=350, paper_bgcolor="#070707", plot_bgcolor="#111111", font_color="#ffffff")
+                st.plotly_chart(fig_sc_val, use_container_width=True)
+            with c_s2:
+                fig_sc_crit = px.bar(
+                    sc_df, x="name", y="critical_skus",
+                    title="Critical Stockout SKUs Count",
+                    labels={"critical_skus": "SKUs Count"}
+                )
+                fig_sc_crit.update_layout(height=350, paper_bgcolor="#070707", plot_bgcolor="#111111", font_color="#ffffff")
+                st.plotly_chart(fig_sc_crit, use_container_width=True)
+                
+            if st.button("Clear Saved Scenarios", key="clear_scenarios_btn"):
+                st.session_state.saved_scenarios = []
+                st.rerun()
+
+        st.divider()
+        st.markdown("##### Scenario Details Table")
         scenario_cols = ["sku","product","stock","avg_daily_demand","lead_time_days","days_of_cover","reorder_point","recommended_order_qty","stockout_risk"]
         render_dark_table(model["inventory_health"][[c for c in scenario_cols if c in model["inventory_health"].columns]].replace([np.inf, -np.inf], np.nan).sort_values("recommended_order_qty", ascending=False), height=500)
 

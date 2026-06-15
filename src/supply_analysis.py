@@ -330,6 +330,7 @@ def build_supply_model(tables: Dict[str, pd.DataFrame], role_map: Dict[str, str 
         critical_skus=("stockout_risk", lambda s: int((s=="Critical").sum())),
         high_risk_skus=("stockout_risk", lambda s: int(s.isin(["Critical","High"]).sum())),
         recommended_order_value=("recommended_order_value","sum"),
+        avg_unit_cost=("unit_cost","mean"),
     )
     supplier_sku["supplier_risk_score"] = (
         (1 - supplier_sku["avg_on_time_rate"].clip(0,1)) * 45
@@ -613,4 +614,74 @@ def procurement_email_draft(reorder_plan: pd.DataFrame, supplier_id: str | None 
     for _, r in df.head(20).iterrows():
         lines.append(f"- {r.get('sku')} / {r.get('product')}: {int(r.get('recommended_order_qty',0))} units, risk {r.get('stockout_risk')}, estimated value {float(r.get('recommended_order_value',0)):,.2f}")
     lines += ["", f"Estimated order value: {total:,.2f}", "", "Please confirm budget, supplier ETA, and any open purchase orders before releasing this order.", "", "Regards,", "SupplyChainOps AI"]
+    return "\n".join(lines)
+
+
+def score_suppliers_mcda(supplier_risk_df: pd.DataFrame, w_price: float, w_speed: float, w_reliability: float, w_quality: float) -> pd.DataFrame:
+    if supplier_risk_df.empty:
+        return pd.DataFrame()
+    
+    df = supplier_risk_df.copy()
+    if "avg_unit_cost" not in df.columns:
+        df["avg_unit_cost"] = 10.0
+        
+    # Price (Lower is better)
+    max_p = df["avg_unit_cost"].max()
+    min_p = df["avg_unit_cost"].min()
+    if max_p != min_p:
+        df["score_price"] = 100 * (max_p - df["avg_unit_cost"]) / (max_p - min_p)
+    else:
+        df["score_price"] = 100.0
+        
+    # Speed/Lead Time (Lower is better)
+    max_lt = df["avg_lead_time"].max()
+    min_lt = df["avg_lead_time"].min()
+    if max_lt != min_lt:
+        df["score_speed"] = 100 * (max_lt - df["avg_lead_time"]) / (max_lt - min_lt)
+    else:
+        df["score_speed"] = 100.0
+        
+    # Reliability/On-time Rate (Higher is better)
+    df["score_reliability"] = df["avg_on_time_rate"] * 100
+    
+    # Quality/Defect Rate (Lower is better)
+    df["score_quality"] = (1.0 - df["avg_defect_rate"]) * 100
+    
+    # Calculate weighted MCDA score
+    total_w = w_price + w_speed + w_reliability + w_quality
+    if total_w <= 0:
+        total_w = 1.0
+        
+    df["mcda_score"] = (
+        w_price * df["score_price"] +
+        w_speed * df["score_speed"] +
+        w_reliability * df["score_reliability"] +
+        w_quality * df["score_quality"]
+    ) / total_w
+    
+    return df.round(2)
+
+
+def generate_rfq_draft(supplier_name: str, sku: str, product_name: str, qty: int, target_price: float, expected_delivery: str) -> str:
+    lines = [
+        f"Subject: Request for Quote (RFQ) - {product_name} ({sku})",
+        "",
+        f"Dear {supplier_name} Team,",
+        "",
+        f"We would like to request a formal quotation for the purchase of the following items:",
+        "",
+        f"- Product Name: {product_name}",
+        f"- SKU: {sku}",
+        f"- Order Quantity: {qty:,} units",
+        f"- Target Unit Price: ${target_price:,.2f}" if target_price > 0 else f"- Target Unit Price: Competitive Market Rate",
+        f"- Requested Delivery Date: {expected_delivery}",
+        "",
+        "Please confirm your capacity to supply this quantity, your standard lead time, payment terms, and total pricing including shipping terms (FOB/DDP).",
+        "",
+        "We look forward to your prompt response.",
+        "",
+        "Best regards,",
+        "Procurement Team",
+        "SupplyChainOps AI System"
+    ]
     return "\n".join(lines)
