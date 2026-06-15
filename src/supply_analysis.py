@@ -37,10 +37,10 @@ def infer_role(table_name: str, df: pd.DataFrame) -> str:
     text = n + " " + cols
     if any(x in text for x in ["purchase_order", "po_id", "ordered_qty", "expected_date"]):
         return "purchase_orders"
-    if any(x in text for x in ["supplier", "vendor", "lead_time", "defect_rate", "on_time"]):
-        return "suppliers"
     if any(x in text for x in ["stock_on_hand", "inventory", "warehouse", "reorder", "stock_quantity"]):
         return "inventory"
+    if any(x in text for x in ["supplier", "vendor", "lead_time", "defect_rate", "on_time"]):
+        return "suppliers"
     if any(x in text for x in ["return", "refund", "return_qty"]):
         return "returns"
     if any(x in text for x in ["sales", "order_date", "quantity_sold", "revenue", "profit"]):
@@ -376,7 +376,136 @@ def build_supply_model(tables: Dict[str, pd.DataFrame], role_map: Dict[str, str 
         {"name":"Dead-stock cleanup", "trigger":"Weekly Monday", "condition":"days_of_cover > 90 or avg_daily_demand < 0.2", "action":"Create markdown/bundling candidate list", "approval_required": True},
         {"name":"Demand spike watch", "trigger":"Daily after sales sync", "condition":"IQR demand anomaly detected", "action":"Check promo/calendar cause and recalculate reorder plan", "approval_required": False},
         {"name":"Budget guardrail", "trigger":"Before PO approval", "condition":"recommended_order_value exceeds monthly budget threshold", "action":"Route to finance approval", "approval_required": True},
-    ]
+    ]    # Calculate returns analysis if returns data is available
+    reasons_summary = []
+    sku_returns_df = pd.DataFrame(columns=["sku", "product", "supplier_id", "supplier_name", "total_return_qty", "total_refund_amount", "total_sales_qty", "return_rate"])
+    supplier_returns_df = pd.DataFrame(columns=["supplier_id", "supplier_name", "supplier_return_qty", "supplier_refund_amount", "supplier_quality_return_qty"])
+    total_refund_value = 0.0
+    total_returns_qty = 0
+
+    if not returns.empty:
+        total_refund_value = float(returns["refund_amount"].sum())
+        total_returns_qty = int(returns["return_qty"].sum())
+        reasons_summary_df = returns.groupby("reason", as_index=False).agg(
+            return_qty=("return_qty", "sum"),
+            refund_amount=("refund_amount", "sum"),
+            cases=("return_qty", "count")
+        )
+        reasons_summary = reasons_summary_df.to_dict(orient="records")
+
+        # SKU return rates
+        sku_returns = returns.groupby("sku", as_index=False).agg(
+            total_return_qty=("return_qty", "sum"),
+            total_refund_amount=("refund_amount", "sum")
+        )
+        sku_sales = sales.groupby("sku", as_index=False).agg(total_sales_qty=("qty", "sum")) if not sales.empty else pd.DataFrame(columns=["sku", "total_sales_qty"])
+        
+        sku_returns_df = base[["sku", "product", "supplier_id", "supplier_name", "unit_cost"]].drop_duplicates("sku").merge(sku_returns, on="sku", how="left").fillna(0)
+        sku_returns_df = sku_returns_df.merge(sku_sales, on="sku", how="left").fillna(0)
+        sku_returns_df["return_rate"] = np.where(
+            sku_returns_df["total_sales_qty"] > 0,
+            (sku_returns_df["total_return_qty"] / sku_returns_df["total_sales_qty"]).clip(0, 1),
+            0.0
+        )
+        
+        # Supplier returns correlation
+        returns_with_supplier = returns.merge(base[["sku", "supplier_id", "supplier_name"]].drop_duplicates("sku"), on="sku", how="left")
+        supplier_returns_df = returns_with_supplier.groupby(["supplier_id", "supplier_name"], as_index=False).agg(
+            supplier_return_qty=("return_qty", "sum"),
+            supplier_refund_amount=("refund_amount", "sum")
+        )
+        
+        # Count quality returns specifically
+        quality_returns = returns_with_supplier[returns_with_supplier["reason"].isin(["quality_issue", "damaged"])]
+        if not quality_returns.empty:
+            supplier_quality = quality_returns.groupby("supplier_id", as_index=False).agg(supplier_quality_return_qty=("return_qty", "sum"))
+            supplier_returns_df = supplier_returns_df.merge(supplier_quality, on="supplier_id", how="left").fillna(0)
+        else:
+            supplier_returns_df["supplier_quality_return_qty"] = 0
+        supplier_returns_df["supplier_quality_return_qty"] = supplier_returns_df["supplier_quality_return_qty"].astype(int)
+
+    # Inter-DC Inventory Transfers Recommendation
+    transfers = []
+    saved_transfer_value = 0.0
+    if "warehouse" in base.columns and base["warehouse"].nunique() > 1:
+        # We find deficit and surplus by SKU
+        for sku, group in base.groupby("sku"):
+            if len(group) < 2:
+                continue
+            deficits = []
+            surpluses = []
+            for _, row in group.iterrows():
+                ss = row.get("safety_stock", 0)
+                rop = row.get("reorder_point", 0)
+                stock = row.get("stock", 0)
+                wh = row.get("warehouse", "Unassigned")
+                
+                if stock < ss:
+                    deficits.append({"warehouse": wh, "qty": ss - stock, "row": row})
+                elif stock > rop:
+                    surpluses.append({"warehouse": wh, "qty": stock - rop, "row": row})
+            
+            # Match deficit and surplus
+            for def_item in deficits:
+                for sur_item in surpluses:
+                    if def_item["qty"] <= 0 or sur_item["qty"] <= 0:
+                        continue
+                    transfer_qty = min(def_item["qty"], sur_item["qty"])
+                    if transfer_qty >= 1:
+                        transfers.append({
+                            "sku": sku,
+                            "product": def_item["row"].get("product", sku),
+                            "from_warehouse": sur_item["warehouse"],
+                            "to_warehouse": def_item["warehouse"],
+                            "qty": int(round(transfer_qty)),
+                            "unit_cost": float(def_item["row"].get("unit_cost", 0)),
+                            "saved_value": float(transfer_qty * def_item["row"].get("unit_cost", 0))
+                        })
+                        def_item["qty"] -= transfer_qty
+                        sur_item["qty"] -= transfer_qty
+        
+        if transfers:
+            saved_transfer_value = sum(t["saved_value"] for t in transfers)
+            # Add an alert if there are transfers
+            alerts.append({
+                "type": "warehouse_transfer",
+                "priority": "P3",
+                "sku": "Multiple",
+                "message": f"Found {len(transfers)} internal stock transfer opportunities to reduce purchasing cost by {saved_transfer_value:,.2f}.",
+                "recommended_action": "Review the Inter-DC Transfer Advisor tab to approve internal inventory routing."
+            })
+
+    # Cost / service level optimization curves
+    service_levels = [0.80, 0.85, 0.90, 0.95, 0.98, 0.99]
+    cost_curves = []
+    # We will compute carrying costs vs stockout penalties under standard penalty factor (1.5x of unit cost/margin)
+    for sl in service_levels:
+        z_score = z_for_service(sl)
+        total_carrying = 0.0
+        total_stockout = 0.0
+        for _, row in base.iterrows():
+            std_demand = row.get("std_daily_demand", 0)
+            lead_time = row.get("lead_time_days", 10)
+            unit_cost = row.get("unit_cost", 0)
+            annual_demand = row.get("annual_demand_qty", 0)
+            
+            ss = z_score * std_demand * np.sqrt(max(1, lead_time))
+            carrying = ss * unit_cost * holding_cost_rate
+            
+            # Approximated penalty is 1.5 times the unit cost
+            penalty = max(1.0, unit_cost * 1.5)
+            shortage = (1 - sl) * annual_demand
+            stockout = shortage * penalty
+            
+            total_carrying += carrying
+            total_stockout += stockout
+            
+        cost_curves.append({
+            "service_level": sl,
+            "carrying_cost": float(total_carrying),
+            "stockout_cost": float(total_stockout),
+            "total_cost": float(total_carrying + total_stockout)
+        })
 
     kpis = {
         "total_inventory_value": float(base["inventory_value"].sum()),
@@ -388,6 +517,10 @@ def build_supply_model(tables: Dict[str, pd.DataFrame], role_map: Dict[str, str 
         "supplier_high_risk": int(supplier_risk["risk_level"].isin(["Critical","High"]).sum()) if not supplier_risk.empty else 0,
         "forecast_horizon_days": horizon_days,
         "service_level": service_level,
+        "total_refund_value": total_refund_value,
+        "total_returns_qty": total_returns_qty,
+        "saved_transfer_value": saved_transfer_value,
+        "transfers_count": len(transfers),
     }
 
     return {
@@ -403,6 +536,11 @@ def build_supply_model(tables: Dict[str, pd.DataFrame], role_map: Dict[str, str 
         "alerts": alerts,
         "automation_playbooks": automation_playbooks,
         "kpis": kpis,
+        "returns_by_reason": reasons_summary,
+        "sku_returns": sku_returns_df,
+        "supplier_returns": supplier_returns_df,
+        "transfers": pd.DataFrame(transfers) if transfers else pd.DataFrame(columns=["sku", "product", "from_warehouse", "to_warehouse", "qty", "unit_cost", "saved_value"]),
+        "cost_curves": cost_curves,
         "params": {"horizon_days": horizon_days, "service_level": service_level, "order_cost": order_cost, "holding_cost_rate": holding_cost_rate, "demand_multiplier": demand_multiplier, "lead_time_delay_days": lead_time_delay_days},
     }
 
@@ -445,8 +583,15 @@ def make_report(model: Dict, ai_text: str = "") -> str:
 
 
 def model_to_jsonable(model: Dict) -> Dict:
-    out = {"kpis": model.get("kpis", {}), "params": model.get("params", {}), "alerts": model.get("alerts", []), "automation_playbooks": model.get("automation_playbooks", [])}
-    for key in ["inventory_health","reorder_plan","supplier_risk","anomalies"]:
+    out = {
+        "kpis": model.get("kpis", {}),
+        "params": model.get("params", {}),
+        "alerts": model.get("alerts", []),
+        "automation_playbooks": model.get("automation_playbooks", []),
+        "returns_by_reason": model.get("returns_by_reason", []),
+        "cost_curves": model.get("cost_curves", []),
+    }
+    for key in ["inventory_health","reorder_plan","supplier_risk","anomalies","sku_returns","supplier_returns","transfers"]:
         df = model.get(key)
         if isinstance(df, pd.DataFrame):
             safe = df.copy()

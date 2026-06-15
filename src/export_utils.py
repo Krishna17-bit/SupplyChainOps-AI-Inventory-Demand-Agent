@@ -14,7 +14,7 @@ def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
 def make_excel_workbook(model: Dict, report_text: str) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        for key in ["inventory_health", "reorder_plan", "supplier_risk", "anomalies"]:
+        for key in ["inventory_health", "reorder_plan", "supplier_risk", "anomalies", "sku_returns", "supplier_returns", "transfers"]:
             df = model.get(key)
             if isinstance(df, pd.DataFrame) and not df.empty:
                 df.replace([float("inf"), float("-inf")], None).to_excel(writer, sheet_name=key[:31], index=False)
@@ -26,11 +26,14 @@ def make_excel_workbook(model: Dict, report_text: str) -> bytes:
 
 
 def make_automation_json(model: Dict, webhook_url: str = "") -> str:
+    transfers = model.get("transfers")
+    transfers_list = transfers.to_dict(orient="records") if isinstance(transfers, pd.DataFrame) else transfers
     payload = {
         "source": "SupplyChainOps AI",
         "webhook_url_placeholder": webhook_url,
         "automation_playbooks": model.get("automation_playbooks", []),
         "alerts": model.get("alerts", [])[:100],
+        "transfers": transfers_list,
         "approval_policy": {
             "auto_create_po": False,
             "auto_send_supplier_email": False,

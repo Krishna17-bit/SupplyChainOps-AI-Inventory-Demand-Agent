@@ -13,7 +13,7 @@ import streamlit as st
 from src.ai_client import AIReasoningClient
 from src.data_loader import env_db_url, load_sample_tables, load_sqlalchemy_tables, load_sqlite_path, load_uploaded_tables
 from src.export_utils import df_to_csv_bytes, make_automation_json, make_excel_workbook
-from src.supply_analysis import build_supply_model, make_report, model_to_jsonable, pick_tables, procurement_email_draft
+from src.supply_analysis import build_supply_model, make_report, model_to_jsonable, pick_tables, procurement_email_draft, z_for_service
 from src.ui_styles import APP_CSS
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -213,12 +213,20 @@ if model:
     with m3: metric_card("Critical SKUs", str(k["critical_skus"]), "Immediate review")
     with m4: metric_card("Supplier risks", str(k["supplier_high_risk"]), "High/Critical suppliers")
 
-    tabs = st.tabs([
-        "Inventory Health", "Demand Forecast", "Stockout Risk", "Reorder Plan", "Supplier Risk",
-        "What-If Simulator", "Automation Center", "Procurement Assistant", "Executive Report", "Export Center"
-    ])
+    tab_names = [
+        "Inventory Health", "Demand Forecast", "SKU Detail Planner", "Stockout Risk", 
+        "Reorder Plan", "Supplier Risk", "Returns & Quality", "Inter-DC Transfers",
+        "What-If Simulator", "ROI & Cost Optimizer", "Automation Center", 
+        "Procurement Assistant", "Executive Report", "Export Center"
+    ]
+    tabs = st.tabs(tab_names)
+    (
+        tab_inv, tab_forecast, tab_sku, tab_risk, 
+        tab_reorder, tab_supplier, tab_returns, tab_transfers, 
+        tab_whatif, tab_roi, tab_auto, tab_procure, tab_report, tab_export
+    ) = tabs
 
-    with tabs[0]:
+    with tab_inv:
         st.markdown("### Inventory health overview")
         inv_health = model["inventory_health"].copy()
         fig_df = inv_health.replace([np.inf, -np.inf], np.nan).copy()
@@ -228,7 +236,7 @@ if model:
             st.plotly_chart(fig, use_container_width=True)
         render_dark_table(inv_health[[c for c in ["sku","product","stock","avg_daily_demand","days_of_cover","inventory_value","stockout_risk","dead_stock_flag","overstock_flag","abc_class"] if c in inv_health.columns]], height=420)
 
-    with tabs[1]:
+    with tab_forecast:
         st.markdown("### Demand forecast")
         df = model["inventory_health"].copy().replace([np.inf, -np.inf], np.nan).sort_values("forecast_horizon_qty", ascending=False)
         top = df.head(20)
@@ -238,7 +246,66 @@ if model:
             st.plotly_chart(fig, use_container_width=True)
         render_dark_table(df[[c for c in ["sku","product","avg_daily_demand","std_daily_demand","forecast_horizon_qty","recent_30d_qty","annual_demand_qty","abc_class"] if c in df.columns]], height=420)
 
-    with tabs[2]:
+    with tab_sku:
+        st.markdown("### SKU Detail Planner")
+        # Select SKU
+        unique_skus = sorted(model["inventory_health"]["sku"].unique())
+        selected_sku = st.selectbox("Select SKU for detailed planning", unique_skus, key="detail_sku_select")
+        
+        # Get SKU details
+        sku_row = model["inventory_health"][model["inventory_health"]["sku"] == selected_sku].iloc[0]
+        st.markdown(f"**Product Name**: {sku_row['product']} | **Warehouse**: {sku_row.get('warehouse', 'Unassigned')} | **Supplier**: {sku_row.get('supplier_name', sku_row['supplier_id'])}")
+        
+        # Display small KPI metrics
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.metric("Stock on Hand", f"{int(sku_row['stock'])}")
+        with c2:
+            st.metric("Days of Cover", f"{sku_row['days_of_cover']:.1f}" if sku_row['days_of_cover'] != np.inf else "∞")
+        with c3:
+            st.metric("Reorder Point", f"{int(round(sku_row['reorder_point']))}")
+        with c4:
+            st.metric("Safety Stock", f"{int(round(sku_row['safety_stock']))}")
+        
+        # Historical sales timeline and forecast projection
+        sales_df = model["sales"]
+        sku_sales = sales_df[sales_df["sku"] == selected_sku].copy()
+        if not sku_sales.empty:
+            # Aggregate sales daily
+            sku_sales["date"] = pd.to_datetime(sku_sales["date"]).dt.normalize()
+            daily_sales = sku_sales.groupby("date")["qty"].sum().reset_index().sort_values("date")
+            
+            # Create interactive line chart
+            fig = go.Figure()
+            # Historical sales line
+            fig.add_trace(go.Scatter(x=daily_sales["date"], y=daily_sales["qty"], name="Historical Sales Qty", line=dict(color="#2f80ed", width=2)))
+            
+            # Forecast trend line starting at the end of history
+            last_date = daily_sales["date"].max()
+            forecast_dates = pd.date_range(last_date + pd.Timedelta(days=1), last_date + pd.Timedelta(days=horizon_days), freq="D")
+            avg_demand = sku_row["avg_daily_demand"]
+            forecast_qty = [avg_demand] * len(forecast_dates)
+            fig.add_trace(go.Scatter(x=forecast_dates, y=forecast_qty, name="Forecasted Daily Demand", line=dict(color="#ff8a1f", dash="dash")))
+            
+            # Add horizontal line for Reorder Point and Safety Stock
+            fig.add_hline(y=sku_row["reorder_point"], line_dash="dash", line_color="#ffb4ab", annotation_text="Reorder Point", annotation_position="top left")
+            fig.add_hline(y=sku_row["safety_stock"], line_dash="dot", line_color="#ffe2a8", annotation_text="Safety Stock", annotation_position="bottom left")
+            
+            fig.update_layout(
+                title=f"Historical Sales and {horizon_days}-Day Forecast Projection for {selected_sku}",
+                xaxis_title="Date",
+                yaxis_title="Quantity",
+                height=450,
+                paper_bgcolor="#070707",
+                plot_bgcolor="#111111",
+                font_color="#ffffff",
+                legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No historical sales data found for this SKU to plot.")
+
+    with tab_risk:
         st.markdown("### Stockout and overstock risk")
         risk_df = model["inventory_health"].copy().replace([np.inf, -np.inf], np.nan)
         risk_counts = risk_df["stockout_risk"].value_counts().reset_index()
@@ -248,7 +315,7 @@ if model:
         st.plotly_chart(fig, use_container_width=True)
         render_dark_table(risk_df.sort_values(["stockout_risk","days_of_cover"])[[c for c in ["sku","product","stock","incoming_qty","days_of_cover","lead_time_days","reorder_point","shortage_qty","stockout_risk","supplier_name"] if c in risk_df.columns]], height=460)
 
-    with tabs[3]:
+    with tab_reorder:
         st.markdown("### Reorder plan")
         reorder = model["reorder_plan"]
         if reorder.empty:
@@ -259,7 +326,7 @@ if model:
             fig.update_layout(height=420, paper_bgcolor="#070707", plot_bgcolor="#111111", font_color="#ffffff")
             st.plotly_chart(fig, use_container_width=True)
 
-    with tabs[4]:
+    with tab_supplier:
         st.markdown("### Supplier risk")
         supplier_risk = model["supplier_risk"]
         render_dark_table(supplier_risk, height=460)
@@ -268,13 +335,157 @@ if model:
             fig.update_layout(height=420, paper_bgcolor="#070707", plot_bgcolor="#111111", font_color="#ffffff", xaxis_tickangle=-25)
             st.plotly_chart(fig, use_container_width=True)
 
-    with tabs[5]:
+    with tab_returns:
+        st.markdown("### Returns & Quality Analytics")
+        if model["returns"].empty:
+            st.info("No returns data uploaded or loaded in the workspace.")
+        else:
+            k_ret = model["kpis"]
+            col_r1, col_r2, col_r3 = st.columns(3)
+            with col_r1:
+                metric_card("Total Returns Quantity", f"{k_ret.get('total_returns_qty', 0):,}", "Units returned by customers")
+            with col_r2:
+                metric_card("Total Refund Value", f"${money(k_ret.get('total_refund_value', 0))}", "Direct capital loss")
+            with col_r3:
+                # Calculate return rate overall
+                total_sales_all = model["sales"]["qty"].sum() if not model["sales"].empty else 1
+                overall_ret_rate = k_ret.get('total_returns_qty', 0) / total_sales_all if total_sales_all > 0 else 0.0
+                metric_card("Overall Return Rate", f"{overall_ret_rate * 100:.2f}%", "Returns vs. total sales volume")
+
+            # Returns by Reason chart & table
+            st.markdown("#### Return Reasons Breakdown")
+            reasons_list = model["returns_by_reason"]
+            if reasons_list:
+                reasons_df = pd.DataFrame(reasons_list)
+                fig_reasons = px.pie(reasons_df, names="reason", values="return_qty", title="Return Quantity by Reason")
+                fig_reasons.update_layout(height=380, paper_bgcolor="#070707", font_color="#ffffff")
+                st.plotly_chart(fig_reasons, use_container_width=True)
+                render_dark_table(reasons_df, height=200)
+
+            # SKU Return Rates
+            st.markdown("#### SKU Return Rates & Rankings")
+            sku_ret_df = model["sku_returns"].copy().sort_values("return_rate", ascending=False)
+            sku_ret_df["return_rate"] = sku_ret_df["return_rate"].map(lambda x: f"{x*100:.2f}%")
+            render_dark_table(sku_ret_df[["sku", "product", "total_return_qty", "total_sales_qty", "return_rate", "total_refund_amount"]], height=320)
+
+            # Supplier Quality Correlation
+            st.markdown("#### Supplier Quality and Defect Correlation")
+            st.markdown("<span class='small-muted'>This correlates quality/damage returns from customers with your supplier's self-reported defect rates.</span>", unsafe_allow_html=True)
+            supp_ret_df = model["supplier_returns"].copy()
+            if not supp_ret_df.empty:
+                # Merge with supplier risk to get self-reported defect rate
+                supp_ret_df = supp_ret_df.merge(model["supplier_risk"][["supplier_id", "avg_defect_rate"]], on="supplier_id", how="left")
+                fig_supp = px.scatter(
+                    supp_ret_df, 
+                    x="avg_defect_rate", 
+                    y="supplier_quality_return_qty", 
+                    size="supplier_refund_amount",
+                    hover_name="supplier_name", 
+                    title="Supplier Defect Rate vs Customer Quality Returns",
+                    labels={"avg_defect_rate": "Supplier Defect Rate", "supplier_quality_return_qty": "Quality/Damaged Returns (Qty)"}
+                )
+                fig_supp.update_layout(height=400, paper_bgcolor="#070707", plot_bgcolor="#111111", font_color="#ffffff")
+                st.plotly_chart(fig_supp, use_container_width=True)
+                render_dark_table(supp_ret_df[["supplier_id", "supplier_name", "supplier_return_qty", "supplier_refund_amount", "supplier_quality_return_qty", "avg_defect_rate"]], height=260)
+
+    with tab_transfers:
+        st.markdown("### Inter-DC Inventory Transfer Advisor")
+        st.markdown("<span class='small-muted'>Re-routing excess stock between warehouses can satisfy local stockouts without initiating new purchase orders.</span>", unsafe_allow_html=True)
+        
+        k_trans = model["kpis"]
+        col_t1, col_t2 = st.columns(2)
+        with col_t1:
+            metric_card("Potential Saved Value", f"${money(k_trans.get('saved_transfer_value', 0))}", "Cost of purchases avoided")
+        with col_t2:
+            metric_card("Transfer Opportunities", f"{k_trans.get('transfers_count', 0)}", "SKU routing adjustments available")
+            
+        trans_df = model["transfers"]
+        if trans_df.empty:
+            st.success("No warehouse transfer opportunities detected under the current stock configuration.")
+        else:
+            render_dark_table(trans_df, height=450)
+            fig_trans = px.bar(
+                trans_df.sort_values("saved_value", ascending=False).head(15), 
+                x="sku", 
+                y="saved_value", 
+                color="qty", 
+                hover_data=["from_warehouse", "to_warehouse"], 
+                title="Top Transfers by Financial Value"
+            )
+            fig_trans.update_layout(height=400, paper_bgcolor="#070707", plot_bgcolor="#111111", font_color="#ffffff")
+            st.plotly_chart(fig_trans, use_container_width=True)
+
+    with tab_whatif:
         st.markdown("### What-if simulator results")
         st.markdown(f"<div class='panel'>Current scenario uses demand multiplier <b>{demand_multiplier:.2f}x</b>, supplier delay <b>{lead_time_delay} days</b>, service level <b>{int(service_level*100)}%</b>, and forecast horizon <b>{horizon_days} days</b>.</div>", unsafe_allow_html=True)
         scenario_cols = ["sku","product","stock","avg_daily_demand","lead_time_days","days_of_cover","reorder_point","recommended_order_qty","stockout_risk"]
         render_dark_table(model["inventory_health"][[c for c in scenario_cols if c in model["inventory_health"].columns]].replace([np.inf, -np.inf], np.nan).sort_values("recommended_order_qty", ascending=False), height=500)
 
-    with tabs[6]:
+    with tab_roi:
+        st.markdown("### ROI & Service-Level Cost Optimizer")
+        st.markdown("<span class='small-muted'>Optimize service level by finding the minimum total cost point where safety stock holding costs and stockout penalties intersect.</span>", unsafe_allow_html=True)
+        
+        # User input for custom stockout penalty multiplier
+        penalty_mult = st.slider("Stockout penalty multiplier (x Unit Cost)", 1.0, 5.0, 1.5, step=0.1, key="penalty_mult_slider")
+        
+        # Recalculate cost curves dynamically based on custom penalty multiplier
+        service_levels = [0.80, 0.85, 0.90, 0.95, 0.98, 0.99]
+        dynamic_curves = []
+        for sl in service_levels:
+            z_score = z_for_service(sl)
+            total_carrying = 0.0
+            total_stockout = 0.0
+            for _, row in model["inventory_health"].iterrows():
+                std_demand = row.get("std_daily_demand", 0)
+                lead_time = row.get("lead_time_days", 10)
+                unit_cost = row.get("unit_cost", 0)
+                annual_demand = row.get("annual_demand_qty", 0)
+                
+                ss = z_score * std_demand * np.sqrt(max(1, lead_time))
+                carrying = ss * unit_cost * model["params"]["holding_cost_rate"]
+                
+                penalty = max(1.0, unit_cost * penalty_mult)
+                shortage = (1 - sl) * annual_demand
+                stockout = shortage * penalty
+                
+                total_carrying += carrying
+                total_stockout += stockout
+                
+            dynamic_curves.append({
+                "Service Level": f"{int(sl*100)}%",
+                "Carrying Cost": total_carrying,
+                "Stockout Cost": total_stockout,
+                "Total Cost": total_carrying + total_stockout
+            })
+            
+        curves_df = pd.DataFrame(dynamic_curves)
+        
+        # Plot Plotly chart
+        fig_roi = go.Figure()
+        fig_roi.add_trace(go.Scatter(x=curves_df["Service Level"], y=curves_df["Carrying Cost"], name="Carrying Cost of Safety Stock", line=dict(color="#ffe2a8", width=2)))
+        fig_roi.add_trace(go.Scatter(x=curves_df["Service Level"], y=curves_df["Stockout Cost"], name="Expected Stockout Cost", line=dict(color="#ffb4ab", width=2)))
+        fig_roi.add_trace(go.Scatter(x=curves_df["Service Level"], y=curves_df["Total Cost"], name="Total Optimization Cost", line=dict(color="#2f80ed", width=3, dash="solid")))
+        
+        # Find optimal service level
+        min_row = curves_df.loc[curves_df["Total Cost"].idxmin()]
+        opt_sl = min_row["Service Level"]
+        
+        fig_roi.update_layout(
+            title=f"Cost Tradeoff Curve (Optimal Service Level: {opt_sl})",
+            xaxis_title="Service Level",
+            yaxis_title="Estimated Annual Cost ($)",
+            height=450,
+            paper_bgcolor="#070707",
+            plot_bgcolor="#111111",
+            font_color="#ffffff",
+            legend=dict(yanchor="top", y=0.99, xanchor="right", x=0.99)
+        )
+        st.plotly_chart(fig_roi, use_container_width=True)
+        
+        st.markdown(f"##### Recommended Target: **{opt_sl} Service Level**")
+        st.markdown(f"At this target level, the estimated carrying cost is **${min_row['Carrying Cost']:,.2f}** and expected stockout penalty is **${min_row['Stockout Cost']:,.2f}**, leading to the minimum total cost of **${min_row['Total Cost']:,.2f}** per year.")
+
+    with tab_auto:
         st.markdown("### Automation Center")
         st.markdown("These are approval-safe automation playbooks that can be wired into n8n, Zapier, Make, Airflow, cron, Slack, email, ERP, or a custom FastAPI backend.")
         render_dark_table(pd.DataFrame(model["automation_playbooks"]), height=280)
@@ -283,7 +494,7 @@ if model:
         automation_json = make_automation_json(model, webhook_url)
         st.code(automation_json[:8000], language="json")
 
-    with tabs[7]:
+    with tab_procure:
         st.markdown("### Procurement Assistant")
         suppliers = ["All suppliers"] + sorted(model["reorder_plan"]["supplier_id"].dropna().astype(str).unique().tolist()) if not model["reorder_plan"].empty and "supplier_id" in model["reorder_plan"].columns else ["All suppliers"]
         chosen_supplier = st.selectbox("Draft for supplier", suppliers)
@@ -291,11 +502,11 @@ if model:
         st.text_area("Approval-gated procurement draft", value=draft, height=360)
         st.caption("No email is sent automatically. This draft is for human review and approval.")
 
-    with tabs[8]:
+    with tab_report:
         st.markdown("### Executive report")
         st.markdown(report)
 
-    with tabs[9]:
+    with tab_export:
         st.markdown("### Export Center")
         audit_json = json.dumps(model_to_jsonable(model), indent=2, default=str)
         excel_bytes = make_excel_workbook(model, report)
