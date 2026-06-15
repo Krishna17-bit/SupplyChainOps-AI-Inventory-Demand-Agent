@@ -14,10 +14,22 @@ def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
 def make_excel_workbook(model: Dict, report_text: str) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        for key in ["inventory_health", "reorder_plan", "supplier_risk", "anomalies", "sku_returns", "supplier_returns", "transfers"]:
+        sheet_mapping = {
+            "inventory_health": "inventory_health",
+            "reorder_plan": "reorder_plan",
+            "supplier_risk": "supplier_risk",
+            "anomalies": "anomalies",
+            "sku_returns": "sku_returns",
+            "supplier_returns": "supplier_returns",
+            "transfers": "transfers",
+            "bom": "bom_recipes",
+            "freight_comparisons": "freight_optimization",
+            "financial_kpis": "financial_kpis"
+        }
+        for key, sheet_name in sheet_mapping.items():
             df = model.get(key)
             if isinstance(df, pd.DataFrame) and not df.empty:
-                df.replace([float("inf"), float("-inf")], None).to_excel(writer, sheet_name=key[:31], index=False)
+                df.replace([float("inf"), float("-inf")], None).to_excel(writer, sheet_name=sheet_name, index=False)
         pd.DataFrame(model.get("alerts", [])).to_excel(writer, sheet_name="alerts", index=False)
         pd.DataFrame(model.get("automation_playbooks", [])).to_excel(writer, sheet_name="automation", index=False)
         pd.DataFrame([model.get("kpis", {})]).to_excel(writer, sheet_name="kpis", index=False)

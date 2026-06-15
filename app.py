@@ -217,16 +217,16 @@ if model:
     with m4: metric_card("Supplier risks", str(k["supplier_high_risk"]), "High/Critical suppliers")
 
     tab_names = [
-        "Inventory Health", "Demand Forecast", "SKU Detail Planner", "Stockout Risk", 
-        "Reorder Plan", "Supplier scorecard & RFQ", "Returns & Quality", "Inter-DC Transfers",
-        "What-If & Scenario Hub", "ROI & Cost Optimizer", "Automation Center", 
+        "Inventory Health", "Demand Forecast", "SKU Detail Planner", "BOM Planner", "Stockout Risk", 
+        "Reorder Plan", "Supplier scorecard & RFQ", "Freight Optimizer", "Returns & Quality", "Inter-DC Transfers",
+        "Financial Health & Velocity", "What-If & Scenario Hub", "ROI & Cost Optimizer", "Automation Center", 
         "Procurement Assistant", "Executive Report", "Export Center"
     ]
     tabs = st.tabs(tab_names)
     (
-        tab_inv, tab_forecast, tab_sku, tab_risk, 
-        tab_reorder, tab_supplier, tab_returns, tab_transfers, 
-        tab_whatif, tab_roi, tab_auto, tab_procure, tab_report, tab_export
+        tab_inv, tab_forecast, tab_sku, tab_bom, tab_risk, 
+        tab_reorder, tab_supplier, tab_freight, tab_returns, tab_transfers, 
+        tab_financial, tab_whatif, tab_roi, tab_auto, tab_procure, tab_report, tab_export
     ) = tabs
 
     with tab_inv:
@@ -354,6 +354,72 @@ if model:
                $$\\text{{Final Order Qty}} = \\max({shortage_qty:.2f}, {eoq:.2f} \\times ({shortage_qty:.2f} > 0)) = {rec_qty:.0f}\\text{{ units}}$$
             """)
 
+    with tab_bom:
+        st.markdown("### Bill of Materials (BOM) & Component Shortage Planner")
+        st.markdown("<span class='small-muted'>Analyze child components/raw materials required to produce finished products. Dynamically explode assembly demand forecasts into raw component shortages.</span>", unsafe_allow_html=True)
+        
+        bom_df = model.get("bom", pd.DataFrame())
+        if bom_df.empty:
+            st.info("No Bill of Materials (BOM) recipes are loaded or detected in the current workspace snapshot.")
+        else:
+            col_b1, col_b2 = st.columns([1, 1])
+            with col_b1:
+                st.markdown("##### 1. BOM Product Recipe Explorer")
+                parents = sorted(bom_df["parent_sku"].dropna().unique())
+                if parents:
+                    selected_parent = st.selectbox("Select Finished Good SKU", parents, key="bom_parent_select")
+                    filtered_bom = bom_df[bom_df["parent_sku"] == selected_parent]
+                    render_dark_table(filtered_bom[["component_sku", "component_name", "qty_required"]], height=260)
+                else:
+                    st.info("No parent assemblies found in BOM.")
+                    selected_parent = None
+            
+            with col_b2:
+                st.markdown("##### 2. Dynamic Forecast Demand Explosion")
+                if selected_parent:
+                    # Get forecast for the parent
+                    parent_data = model["inventory_health"][model["inventory_health"]["sku"] == selected_parent]
+                    if not parent_data.empty:
+                        parent_row = parent_data.iloc[0]
+                        parent_forecast = float(parent_row.get("forecast_horizon_qty", 0))
+                        parent_prod_name = parent_row.get("product", selected_parent)
+                        
+                        st.markdown(f"**Parent Product**: {parent_prod_name} | **{horizon_days}-Day Forecast**: {int(parent_forecast):,} units")
+                        
+                        explosion = filtered_bom.copy()
+                        # Merge current stock details of component
+                        comp_details = model["inventory_health"][["sku", "product", "stock", "reorder_point", "recommended_order_qty"]].rename(
+                            columns={"sku": "component_sku", "product": "comp_name_inv"}
+                        )
+                        explosion = explosion.merge(comp_details, on="component_sku", how="left").fillna({"stock": 0, "reorder_point": 0, "recommended_order_qty": 0})
+                        
+                        explosion["required_for_forecast"] = (explosion["qty_required"] * parent_forecast).round(1)
+                        explosion["shortage_for_forecast"] = (explosion["required_for_forecast"] - explosion["stock"]).clip(lower=0).round(1)
+                        
+                        render_dark_table(
+                            explosion[["component_sku", "component_name", "qty_required", "stock", "required_for_forecast", "shortage_for_forecast"]],
+                            height=260
+                        )
+                    else:
+                        st.info("Finished SKU not found in inventory health database.")
+                else:
+                    st.info("Select a finished SKU to calculate component requirements.")
+            
+            st.divider()
+            st.markdown("##### 3. Global Component Inventory & Replenishment Plan")
+            st.markdown("<span class='small-muted'>This lists all raw components defined in active recipes, displaying their stock status, exploded reorder points, and recommended order quantities.</span>", unsafe_allow_html=True)
+            
+            # Filter inventory health where SKU is in components list
+            components_list = bom_df["component_sku"].unique()
+            comp_inv = model["inventory_health"][model["inventory_health"]["sku"].isin(components_list)].copy()
+            if not comp_inv.empty:
+                render_dark_table(
+                    comp_inv[["sku", "product", "stock", "avg_daily_demand", "reorder_point", "recommended_order_qty", "recommended_order_value", "stockout_risk"]],
+                    height=360
+                )
+            else:
+                st.info("No components found matching current BOM list in inventory database.")
+
     with tab_risk:
         st.markdown("### Stockout and overstock risk")
         risk_df = model["inventory_health"].copy().replace([np.inf, -np.inf], np.nan)
@@ -450,6 +516,54 @@ if model:
         else:
             st.info("Suppliers or inventory data not available to generate RFQ.")
 
+    with tab_freight:
+        st.markdown("### Air vs. Ocean Freight Mode Cost-Tradeoff Optimizer")
+        st.markdown("<span class='small-muted'>Evaluate shipping speed and safety stock carrying costs against direct transportation freight costs. Ocean is cheap but slow; Air is fast but expensive.</span>", unsafe_allow_html=True)
+        
+        freight_df = model.get("freight_comparisons", pd.DataFrame())
+        if freight_df.empty:
+            st.info("No freight mode comparisons available.")
+        else:
+            # Aggregate calculations
+            air_count = int((freight_df["recommended_mode"] == "Air").sum())
+            ocean_count = int((freight_df["recommended_mode"] == "Ocean").sum())
+            total_ocean_scenario = float(freight_df["total_cost_ocean"].sum())
+            total_air_scenario = float(freight_df["total_cost_air"].sum())
+            optimized_cost = float(np.where(freight_df["recommended_mode"] == "Air", freight_df["total_cost_air"], freight_df["total_cost_ocean"]).sum())
+            savings = float((freight_df["total_cost_ocean"] - freight_df["total_cost_air"])[freight_df["recommended_mode"] == "Air"].sum())
+            
+            c_f1, c_f2, c_f3 = st.columns(3)
+            with c_f1:
+                metric_card("Annual Optimization Savings", f"${money(savings)}", "Savings of Air over Ocean on recommended items")
+            with c_f2:
+                metric_card("Optimal Mode Splits", f"Air: {air_count} | Ocean: {ocean_count}", "Count of items recommended per mode")
+            with c_f3:
+                metric_card("Portfolio Optimized Logistics Cost", f"${money(optimized_cost)}", "Total minimized transportation and carrying costs")
+            
+            st.divider()
+            
+            # Bar chart
+            st.markdown("#### Ocean vs. Air Annual Total Cost Comparison (Top 10 SKUs)")
+            top_freight = freight_df.sort_values("annual_demand", ascending=False).head(10)
+            if not top_freight.empty:
+                melted = top_freight.melt(id_vars=["sku", "product"], value_vars=["total_cost_ocean", "total_cost_air"], var_name="Mode", value_name="Annual Cost ($)")
+                melted["Mode"] = melted["Mode"].map({"total_cost_ocean": "Ocean (Bulk)", "total_cost_air": "Air (Express)"})
+                
+                fig_freight = px.bar(melted, x="sku", y="Annual Cost ($)", color="Mode", barmode="group",
+                                     color_discrete_map={"Ocean (Bulk)": "#0055ff", "Air (Express)": "#ff6b00"})
+                fig_freight.update_layout(height=400, paper_bgcolor="#070707", plot_bgcolor="#111111", font_color="#ffffff")
+                st.plotly_chart(fig_freight, use_container_width=True)
+            
+            st.markdown("#### Detailed Freight Mode Analysis and Recommendations")
+            # Select columns to display
+            display_cols = [
+                "sku", "product", "annual_demand", "unit_cost", 
+                "lead_time_ocean", "lead_time_air", 
+                "total_cost_ocean", "total_cost_air", 
+                "recommended_mode", "cost_difference"
+            ]
+            render_dark_table(freight_df[display_cols].sort_values("cost_difference", ascending=False), height=380)
+
     with tab_returns:
         st.markdown("### Returns & Quality Analytics")
         if model["returns"].empty:
@@ -529,6 +643,90 @@ if model:
             )
             fig_trans.update_layout(height=400, paper_bgcolor="#070707", plot_bgcolor="#111111", font_color="#ffffff")
             st.plotly_chart(fig_trans, use_container_width=True)
+
+    with tab_financial:
+        st.markdown("### Financial Inventory Velocity & Carrying Cost Analysis")
+        st.markdown("<span class='small-muted'>Analyze inventory velocity (turnover ratios and days of inventory outstanding) alongside carrying costs segmented by storage class.</span>", unsafe_allow_html=True)
+        
+        fin_df = model.get("financial_kpis", pd.DataFrame())
+        if fin_df.empty:
+            st.info("No financial metrics available.")
+        else:
+            k_fin = model["kpis"]
+            col_f1, col_f2, col_f3 = st.columns(3)
+            with col_f1:
+                metric_card("Portfolio Days Inventory Outstanding (DIO)", f"{k_fin.get('portfolio_dio', 0.0):.1f} Days", "Average time required to turn inventory")
+            with col_f2:
+                metric_card("Portfolio Inventory Turnover Ratio (ITR)", f"{k_fin.get('portfolio_itr', 0.0):.2f}x / Year", "Annual speed of inventory cycles")
+            with col_f3:
+                metric_card("Total Annual Inventory Carrying Cost", f"${money(k_fin.get('total_annual_carrying_cost', 0.0))}", "Carrying costs locked in portfolio safety/cycle stock")
+                
+            st.divider()
+            
+            # Scatter plot ITR vs DIO
+            st.markdown("#### Inventory Velocity Mapping: ITR vs. DIO")
+            fig_fin = px.scatter(
+                fin_df, 
+                x="dio", 
+                y="itr", 
+                size="average_inventory_value", 
+                color="storage_class",
+                hover_name="product",
+                hover_data=["sku", "annual_cogs", "average_inventory_value"],
+                title="Portfolio SKU Distribution (Size = Average Inventory Value)",
+                labels={"dio": "Days Inventory Outstanding (DIO)", "itr": "Inventory Turnover Ratio (ITR)"}
+            )
+            fig_fin.update_layout(height=450, paper_bgcolor="#070707", plot_bgcolor="#111111", font_color="#ffffff")
+            st.plotly_chart(fig_fin, use_container_width=True)
+            
+            st.divider()
+            
+            # Storage Class Breakdown
+            col_sc1, col_sc2 = st.columns([1, 1])
+            with col_sc1:
+                st.markdown("##### 1. Carrying Cost Breakdown by Storage Class")
+                sc_breakdown = fin_df.groupby("storage_class").agg(
+                    sku_count=("sku", "count"),
+                    total_avg_inventory_val=("average_inventory_value", "sum"),
+                    total_annual_carrying_cost=("annual_carrying_cost", "sum")
+                ).reset_index()
+                
+                # Pie chart using HSL harmonious colors or explicit blue/orange theme color map
+                fig_sc = px.pie(
+                    sc_breakdown, 
+                    names="storage_class", 
+                    values="total_annual_carrying_cost", 
+                    title="Annual Carrying Cost Contribution by Storage Class",
+                    color_discrete_sequence=["#ff6b00", "#0055ff", "#9ca3af"]
+                )
+                fig_sc.update_layout(height=350, paper_bgcolor="#070707", font_color="#ffffff")
+                st.plotly_chart(fig_sc, use_container_width=True)
+                
+            with col_sc2:
+                st.markdown("##### 2. Storage Class Financial Metrics Summary")
+                # Group by and format output
+                sc_summary = fin_df.groupby("storage_class").agg(
+                    SKUs=("sku", "count"),
+                    Annual_COGS=("annual_cogs", "sum"),
+                    Avg_Inventory_Value=("average_inventory_value", "sum"),
+                    Annual_Carrying_Cost=("annual_carrying_cost", "sum")
+                ).reset_index()
+                
+                # Format money columns
+                sc_summary_disp = sc_summary.copy()
+                for col in ["Annual_COGS", "Avg_Inventory_Value", "Annual_Carrying_Cost"]:
+                    sc_summary_disp[col] = sc_summary_disp[col].map(lambda x: f"${x:,.2f}")
+                
+                render_dark_table(sc_summary_disp, height=280)
+                
+            st.divider()
+            st.markdown("#### Detailed SKU-level Financial Performance")
+            # Select columns
+            fin_cols = [
+                "sku", "product", "storage_class", "annual_cogs", 
+                "average_inventory_value", "itr", "dio", "annual_carrying_cost"
+            ]
+            render_dark_table(fin_df[fin_cols].sort_values("annual_carrying_cost", ascending=False), height=380)
 
     with tab_whatif:
         st.markdown("### What-if Simulator & Scenario Hub")

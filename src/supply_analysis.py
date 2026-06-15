@@ -35,6 +35,8 @@ def infer_role(table_name: str, df: pd.DataFrame) -> str:
     n = _norm(table_name)
     cols = " ".join(_norm(c) for c in df.columns)
     text = n + " " + cols
+    if any(x in text for x in ["bom", "bill_of_materials", "recipe", "component_map", "parent_sku"]):
+        return "bom"
     if any(x in text for x in ["purchase_order", "po_id", "ordered_qty", "expected_date"]):
         return "purchase_orders"
     if any(x in text for x in ["stock_on_hand", "inventory", "warehouse", "reorder", "stock_quantity"]):
@@ -49,7 +51,7 @@ def infer_role(table_name: str, df: pd.DataFrame) -> str:
 
 
 def pick_tables(tables: Dict[str, pd.DataFrame]) -> Dict[str, str | None]:
-    roles = {"sales": None, "inventory": None, "suppliers": None, "purchase_orders": None, "returns": None}
+    roles = {"sales": None, "inventory": None, "suppliers": None, "purchase_orders": None, "returns": None, "bom": None}
     for name, df in tables.items():
         role = infer_role(name, df)
         if role in roles and roles[role] is None:
@@ -99,7 +101,7 @@ def standardize_sales(df: pd.DataFrame | None) -> pd.DataFrame:
 
 def standardize_inventory(df: pd.DataFrame | None) -> pd.DataFrame:
     if df is None or df.empty:
-        return pd.DataFrame(columns=["sku","product","stock","unit_cost","supplier_id","warehouse","min_order_qty"])
+        return pd.DataFrame(columns=["sku","product","stock","unit_cost","supplier_id","warehouse","min_order_qty","storage_class"])
     d = df.copy()
     sku = _find_col(d, ["sku","product_id","item_id","item_code","product_code"])
     product = _find_col(d, ["product","product_name","item","item_name","name"])
@@ -108,6 +110,7 @@ def standardize_inventory(df: pd.DataFrame | None) -> pd.DataFrame:
     supplier = _find_col(d, ["supplier_id","vendor_id","supplier","vendor"])
     warehouse = _find_col(d, ["warehouse","location","dc","fulfillment_center"])
     moq = _find_col(d, ["min_order_qty","moq","minimum_order_quantity"])
+    storage_class = _find_col(d, ["storage_class", "class", "storage_type"])
     out = pd.DataFrame()
     out["sku"] = d[sku].astype(str) if sku else d.index.astype(str)
     out["product"] = d[product].astype(str) if product else out["sku"]
@@ -116,6 +119,7 @@ def standardize_inventory(df: pd.DataFrame | None) -> pd.DataFrame:
     out["supplier_id"] = d[supplier].astype(str) if supplier else "UNKNOWN"
     out["warehouse"] = d[warehouse].astype(str) if warehouse else "Unassigned"
     out["min_order_qty"] = pd.to_numeric(d[moq], errors="coerce").fillna(1) if moq else 1
+    out["storage_class"] = d[storage_class].astype(str).str.lower() if storage_class else "standard"
     return out
 
 
@@ -189,6 +193,23 @@ def standardize_returns(df: pd.DataFrame | None) -> pd.DataFrame:
     return out.dropna(subset=["date"])
 
 
+def standardize_bom(df: pd.DataFrame | None) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["parent_sku","component_sku","component_name","qty_required"])
+    d = df.copy()
+    parent = _find_col(d, ["parent_sku", "parent", "finished_sku", "sku"])
+    comp = _find_col(d, ["component_sku", "component", "child_sku"])
+    name = _find_col(d, ["component_name", "name", "component_title", "title"])
+    qty = _find_col(d, ["qty_required", "quantity", "qty", "units_required"])
+    
+    out = pd.DataFrame()
+    out["parent_sku"] = d[parent].astype(str) if parent else "UNKNOWN"
+    out["component_sku"] = d[comp].astype(str) if comp else "UNKNOWN"
+    out["component_name"] = d[name].astype(str) if name else out["component_sku"]
+    out["qty_required"] = pd.to_numeric(d[qty], errors="coerce").fillna(1.0) if qty else 1.0
+    return out
+
+
 def z_for_service(service_level: float) -> float:
     # Common service-level approximations.
     if service_level >= .99:
@@ -210,12 +231,47 @@ def build_supply_model(tables: Dict[str, pd.DataFrame], role_map: Dict[str, str 
     suppliers = standardize_suppliers(tables.get(role_map.get("suppliers")) if role_map.get("suppliers") else None)
     pos = standardize_pos(tables.get(role_map.get("purchase_orders")) if role_map.get("purchase_orders") else None)
     returns = standardize_returns(tables.get(role_map.get("returns")) if role_map.get("returns") else None)
+    bom = standardize_bom(tables.get(role_map.get("bom")) if role_map.get("bom") else None)
+
+    # Generate mock BOM recipes if bom is empty (and sample data is used)
+    is_mock_bom = False
+    if bom.empty and not inv.empty:
+        is_mock_bom = True
+        mock_bom_data = [
+            {"parent_sku": "SKU-001", "component_sku": "COMP-001", "component_name": "Premium Glass Bottle", "qty_required": 1.0},
+            {"parent_sku": "SKU-001", "component_sku": "COMP-002", "component_name": "Leakproof Cap w/ Seal", "qty_required": 1.0},
+            {"parent_sku": "SKU-001", "component_sku": "COMP-003", "component_name": "Silicone Straw & Cap Attachment", "qty_required": 1.0},
+            
+            {"parent_sku": "SKU-002", "component_sku": "COMP-004", "component_name": "Foil Protein Bar Wrapper", "qty_required": 12.0},
+            {"parent_sku": "SKU-002", "component_sku": "COMP-005", "component_name": "Corrugated Display Carton Box", "qty_required": 1.0},
+            
+            {"parent_sku": "SKU-003", "component_sku": "COMP-006", "component_name": "Nylon Mat Carrying Strap", "qty_required": 1.0},
+            {"parent_sku": "SKU-003", "component_sku": "COMP-007", "component_name": "Eco-friendly TPE Mat Roll (Purple)", "qty_required": 1.0},
+        ]
+        bom = pd.DataFrame(mock_bom_data)
 
     if inv.empty and not sales.empty:
         inv = sales.groupby(["sku","product"], as_index=False).agg(stock=("qty", lambda s: max(0, int(s.tail(30).mean()*15))), unit_cost=("cost", "mean"))
         inv["supplier_id"] = "UNKNOWN"
         inv["warehouse"] = "Unassigned"
         inv["min_order_qty"] = 1
+        inv["storage_class"] = "standard"
+
+    if is_mock_bom and not inv.empty:
+        mock_comp_rows = [
+            {"sku": "COMP-001", "product": "Premium Glass Bottle", "stock": 45, "unit_cost": 1.20, "supplier_id": "SUP-01", "warehouse": "Bengaluru DC", "min_order_qty": 500, "storage_class": "fragile"},
+            {"sku": "COMP-002", "product": "Leakproof Cap w/ Seal", "stock": 120, "unit_cost": 0.30, "supplier_id": "SUP-01", "warehouse": "Bengaluru DC", "min_order_qty": 1000, "storage_class": "standard"},
+            {"sku": "COMP-003", "product": "Silicone Straw & Cap Attachment", "stock": 15, "unit_cost": 0.45, "supplier_id": "SUP-03", "warehouse": "Bengaluru DC", "min_order_qty": 500, "storage_class": "standard"},
+            {"sku": "COMP-004", "product": "Foil Protein Bar Wrapper", "stock": 2500, "unit_cost": 0.08, "supplier_id": "SUP-02", "warehouse": "Mumbai DC", "min_order_qty": 10000, "storage_class": "standard"},
+            {"sku": "COMP-005", "product": "Corrugated Display Carton Box", "stock": 80, "unit_cost": 0.50, "supplier_id": "SUP-02", "warehouse": "Mumbai DC", "min_order_qty": 1000, "storage_class": "standard"},
+            {"sku": "COMP-006", "product": "Nylon Mat Carrying Strap", "stock": 35, "unit_cost": 0.80, "supplier_id": "SUP-03", "warehouse": "Mumbai DC", "min_order_qty": 500, "storage_class": "standard"},
+            {"sku": "COMP-007", "product": "Eco-friendly TPE Mat Roll (Purple)", "stock": 8, "unit_cost": 4.50, "supplier_id": "SUP-03", "warehouse": "Mumbai DC", "min_order_qty": 200, "storage_class": "cold-chain"},
+        ]
+        mock_comp_df = pd.DataFrame(mock_comp_rows)
+        existing_skus = set(inv["sku"].unique())
+        mock_comp_df = mock_comp_df[~mock_comp_df["sku"].isin(existing_skus)]
+        if not mock_comp_df.empty:
+            inv = pd.concat([inv, mock_comp_df], ignore_index=True)
 
     if suppliers.empty and not inv.empty:
         suppliers = pd.DataFrame({"supplier_id": inv["supplier_id"].fillna("UNKNOWN").unique()})
@@ -266,7 +322,44 @@ def build_supply_model(tables: Dict[str, pd.DataFrame], role_map: Dict[str, str 
     sku_stats["std_daily_demand"] *= demand_multiplier
     sku_stats["forecast_horizon_qty"] = sku_stats["avg_daily_demand"] * horizon_days
 
-    base = inv.merge(sku_stats, on=["sku","product"], how="outer").fillna({"stock":0,"unit_cost":0,"supplier_id":"UNKNOWN","warehouse":"Unassigned","min_order_qty":1,"avg_daily_demand":0,"std_daily_demand":0,"forecast_horizon_qty":0,"annual_demand_qty":0,"annual_revenue":0,"annual_profit":0})
+    base = inv.merge(sku_stats, on=["sku","product"], how="outer").fillna({"stock":0,"unit_cost":0,"supplier_id":"UNKNOWN","warehouse":"Unassigned","min_order_qty":1,"storage_class":"standard","avg_daily_demand":0,"std_daily_demand":0,"forecast_horizon_qty":0,"annual_demand_qty":0,"annual_revenue":0,"annual_profit":0})
+    
+    # Calculate dependent demand for components
+    base["is_component"] = base["sku"].isin(bom["component_sku"])
+    base["component_avg_daily_demand"] = 0.0
+    base["component_forecast_qty"] = 0.0
+    base["component_annual_demand"] = 0.0
+    base["component_std_daily_demand"] = 0.0
+    
+    if not bom.empty:
+        for comp_sku, comp_group in bom.groupby("component_sku"):
+            dep_avg_demand = 0.0
+            dep_forecast_qty = 0.0
+            dep_annual_demand = 0.0
+            dep_std_demand = 0.0
+            for _, r_bom in comp_group.iterrows():
+                parent_sku = r_bom["parent_sku"]
+                qty_req = r_bom["qty_required"]
+                parent_rows = base[base["sku"] == parent_sku]
+                if not parent_rows.empty:
+                    dep_avg_demand += parent_rows["avg_daily_demand"].sum() * qty_req
+                    dep_forecast_qty += parent_rows["forecast_horizon_qty"].sum() * qty_req
+                    dep_annual_demand += parent_rows["annual_demand_qty"].sum() * qty_req
+                    dep_std_demand += parent_rows["std_daily_demand"].sum() * qty_req
+            base.loc[base["sku"] == comp_sku, "component_avg_daily_demand"] = dep_avg_demand
+            base.loc[base["sku"] == comp_sku, "component_forecast_qty"] = dep_forecast_qty
+            base.loc[base["sku"] == comp_sku, "component_annual_demand"] = dep_annual_demand
+            base.loc[base["sku"] == comp_sku, "component_std_daily_demand"] = dep_std_demand
+            
+        comp_mask = base["is_component"]
+        base.loc[comp_mask, "avg_daily_demand"] = base.loc[comp_mask, "component_avg_daily_demand"]
+        base.loc[comp_mask, "forecast_horizon_qty"] = base.loc[comp_mask, "component_forecast_qty"]
+        base.loc[comp_mask, "annual_demand_qty"] = base.loc[comp_mask, "component_annual_demand"]
+        base.loc[comp_mask, "std_daily_demand"] = base.loc[comp_mask, "component_std_daily_demand"]
+
+    # Dynamic holding cost rate by storage class
+    base["holding_cost_rate"] = base["storage_class"].apply(lambda sc: 0.28 if sc == "fragile" else (0.35 if sc == "cold-chain" else holding_cost_rate))
+
     base = base.merge(suppliers, on="supplier_id", how="left", suffixes=("", "_supplier"))
     base["lead_time_days"] = pd.to_numeric(base["lead_time_days"], errors="coerce").fillna(10) + lead_time_delay_days
     base["lead_time_std_days"] = pd.to_numeric(base["lead_time_std_days"], errors="coerce").fillna(3)
@@ -289,7 +382,7 @@ def build_supply_model(tables: Dict[str, pd.DataFrame], role_map: Dict[str, str 
 
     annual_demand = base["annual_demand_qty"].clip(lower=0)
     unit_cost = base["unit_cost"].replace(0, np.nan).fillna(1)
-    annual_holding = (holding_cost_rate * unit_cost).clip(lower=0.01)
+    annual_holding = (base["holding_cost_rate"] * unit_cost).clip(lower=0.01)
     base["eoq"] = np.sqrt((2 * annual_demand * max(order_cost, 0.01)) / annual_holding).replace([np.inf, -np.inf], 0).fillna(0)
     base["recommended_order_qty"] = np.maximum(base["shortage_qty"], base["eoq"] * (base["shortage_qty"] > 0)).round(0)
     base["recommended_order_qty"] = np.maximum(base["recommended_order_qty"], np.where(base["shortage_qty"] > 0, base["min_order_qty"], 0)).round(0)
@@ -508,6 +601,65 @@ def build_supply_model(tables: Dict[str, pd.DataFrame], role_map: Dict[str, str 
             "total_cost": float(total_carrying + total_stockout)
         })
 
+    # Freight Mode Optimizer calculations (Air vs Ocean)
+    freight_df = pd.DataFrame()
+    freight_df["sku"] = base["sku"]
+    freight_df["product"] = base["product"]
+    freight_df["annual_demand"] = base["annual_demand_qty"].clip(lower=0)
+    freight_df["unit_cost"] = base["unit_cost"]
+    
+    lead_time_ocean = base["lead_time_days"].clip(lower=1)
+    lead_time_air = np.maximum(3.0, base["lead_time_days"] * 0.25).round(1)
+    freight_df["lead_time_ocean"] = lead_time_ocean
+    freight_df["lead_time_air"] = lead_time_air
+    
+    freight_cost_ocean_unit = (base["unit_cost"] * 0.08 + 0.50).round(2)
+    freight_cost_air_unit = (base["unit_cost"] * 0.30 + 4.00).round(2)
+    freight_df["freight_cost_ocean_unit"] = freight_cost_ocean_unit
+    freight_df["freight_cost_air_unit"] = freight_cost_air_unit
+    
+    freight_df["annual_freight_ocean"] = freight_df["annual_demand"] * freight_cost_ocean_unit
+    freight_df["annual_freight_air"] = freight_df["annual_demand"] * freight_cost_air_unit
+    
+    z = z_for_service(service_level)
+    ss_ocean = z * base["std_daily_demand"] * np.sqrt(lead_time_ocean)
+    ss_air = z * base["std_daily_demand"] * np.sqrt(lead_time_air)
+    
+    freight_df["carrying_cost_ocean"] = ss_ocean * base["unit_cost"] * base["holding_cost_rate"]
+    freight_df["carrying_cost_air"] = ss_air * base["unit_cost"] * base["holding_cost_rate"]
+    
+    freight_df["pipeline_cost_ocean"] = (freight_df["annual_demand"] * base["unit_cost"] * base["holding_cost_rate"] * (lead_time_ocean / 365.0))
+    freight_df["pipeline_cost_air"] = (freight_df["annual_demand"] * base["unit_cost"] * base["holding_cost_rate"] * (lead_time_air / 365.0))
+    
+    freight_df["total_cost_ocean"] = freight_df["annual_freight_ocean"] + freight_df["carrying_cost_ocean"] + freight_df["pipeline_cost_ocean"]
+    freight_df["total_cost_air"] = freight_df["annual_freight_air"] + freight_df["carrying_cost_air"] + freight_df["pipeline_cost_air"]
+    
+    freight_df["recommended_mode"] = np.where(freight_df["total_cost_air"] < freight_df["total_cost_ocean"], "Air", "Ocean")
+    freight_df["cost_difference"] = np.abs(freight_df["total_cost_air"] - freight_df["total_cost_ocean"])
+
+    # Financial health & velocity dashboard calculations (DIO, Turnover, carrying costs)
+    fin_df = pd.DataFrame()
+    fin_df["sku"] = base["sku"]
+    fin_df["product"] = base["product"]
+    fin_df["storage_class"] = base["storage_class"]
+    fin_df["annual_cogs"] = (base["annual_demand_qty"] * base["unit_cost"]).clip(lower=0)
+    
+    avg_inv_qty = np.maximum(base["safety_stock"] + (base["eoq"] / 2.0), base["stock"])
+    fin_df["average_inventory_value"] = (avg_inv_qty * base["unit_cost"]).clip(lower=0)
+    
+    fin_df["itr"] = np.where(
+        fin_df["average_inventory_value"] > 0,
+        fin_df["annual_cogs"] / fin_df["average_inventory_value"],
+        0.0
+    )
+    fin_df["dio"] = np.where(
+        fin_df["itr"] > 0,
+        365.0 / fin_df["itr"],
+        365.0
+    )
+    fin_df["dio"] = np.minimum(fin_df["dio"], 365.0)
+    fin_df["annual_carrying_cost"] = fin_df["average_inventory_value"] * base["holding_cost_rate"]
+
     kpis = {
         "total_inventory_value": float(base["inventory_value"].sum()),
         "recommended_order_value": float(reorder_plan["recommended_order_value"].sum()) if not reorder_plan.empty and "recommended_order_value" in reorder_plan else 0.0,
@@ -522,6 +674,11 @@ def build_supply_model(tables: Dict[str, pd.DataFrame], role_map: Dict[str, str 
         "total_returns_qty": total_returns_qty,
         "saved_transfer_value": saved_transfer_value,
         "transfers_count": len(transfers),
+        "total_annual_cogs": float(fin_df["annual_cogs"].sum()),
+        "total_avg_inventory_value": float(fin_df["average_inventory_value"].sum()),
+        "portfolio_itr": float(fin_df["annual_cogs"].sum() / fin_df["average_inventory_value"].sum()) if fin_df["average_inventory_value"].sum() > 0 else 0.0,
+        "portfolio_dio": float(365.0 * fin_df["average_inventory_value"].sum() / fin_df["annual_cogs"].sum()) if fin_df["annual_cogs"].sum() > 0 else 365.0,
+        "total_annual_carrying_cost": float(fin_df["annual_carrying_cost"].sum()),
     }
 
     return {
@@ -530,6 +687,9 @@ def build_supply_model(tables: Dict[str, pd.DataFrame], role_map: Dict[str, str 
         "suppliers": suppliers,
         "purchase_orders": pos,
         "returns": returns,
+        "bom": bom,
+        "freight_comparisons": freight_df,
+        "financial_kpis": fin_df,
         "inventory_health": base.sort_values(["stockout_risk","inventory_value"], ascending=[True, False]),
         "reorder_plan": reorder_plan,
         "supplier_risk": supplier_risk,
@@ -592,7 +752,7 @@ def model_to_jsonable(model: Dict) -> Dict:
         "returns_by_reason": model.get("returns_by_reason", []),
         "cost_curves": model.get("cost_curves", []),
     }
-    for key in ["inventory_health","reorder_plan","supplier_risk","anomalies","sku_returns","supplier_returns","transfers"]:
+    for key in ["inventory_health","reorder_plan","supplier_risk","anomalies","sku_returns","supplier_returns","transfers","bom","freight_comparisons","financial_kpis"]:
         df = model.get(key)
         if isinstance(df, pd.DataFrame):
             safe = df.copy()
